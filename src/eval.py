@@ -109,16 +109,37 @@ def eval(cfg: DictConfig) -> tuple[dict[str, Any], dict[str, Any]]:
     assert (ckpt_path is None) ^ (state_dict_hf_path is None), "You must provide one of ckpt_path or state_dict_hf_path"
 
     if state_dict_hf_path is not None:
-        # Provided a remote state dict path
-        log.info("Downloading weights from huggingface...")
-        dst_dir = os.path.join(cfg.paths.scratch_dir, "model-weights")
-        state_dict_path = download_weights(hf_filepath=state_dict_hf_path, destination_dir=dst_dir)
+        # Check if it's a local path or remote HuggingFace path
+        if os.path.isfile(state_dict_hf_path):
+            log.info(f"Loading weights from local path: {state_dict_hf_path}")
+            state_dict_path = state_dict_hf_path
+        else:
+            log.info("Downloading weights from huggingface...")
+            dst_dir = os.path.join(cfg.paths.scratch_dir, "model-weights")
+            state_dict_path = download_weights(hf_filepath=state_dict_hf_path, destination_dir=dst_dir)
 
         # Directly load the state dict into model
         assert not cfg.model.ema_decay, (
             "Setting ema decay will cause silent errors in evaluation when using huggingface weights"
         )
-        state_dict = torch.load(state_dict_path, map_location="cpu")
+        state_dict = torch.load(state_dict_path, map_location="cpu", weights_only=False)
+        
+        # Handle EMA checkpoint: if keys have 'net.model.' prefix, strip it and use EMA shadow params
+        if any(k.startswith("net.model.") for k in state_dict.keys()):
+            log.info("Detected EMA checkpoint, extracting model weights...")
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                # Skip EMA-specific keys
+                if "shadow_params" in k or "num_updates" in k:
+                    continue
+                # Strip the '.model' prefix: net.model.X -> net.X
+                if k.startswith("net.model."):
+                    new_key = "net." + k[len("net.model."):]
+                    new_state_dict[new_key] = v
+                else:
+                    new_state_dict[k] = v
+            state_dict = new_state_dict
+        
         model.load_state_dict(state_dict)
 
     assert cfg.get("val", False) or cfg.get("test", False), "At least one of validation or test must be enabled!"
