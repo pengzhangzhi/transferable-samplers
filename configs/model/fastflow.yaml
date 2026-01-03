@@ -1,0 +1,40 @@
+defaults:
+  - default
+  - net: tarflow_single_system
+  - scheduler: cosine
+
+_target_: src.models.fastflow_module.FastFlowLitModule
+mean_free_prior: False
+
+# Teacher checkpoint path (must be provided in experiment config)
+teacher_ckpt_path: ???
+
+# Feature alignment adapters
+adapter_dim: 1
+
+# Loss weights
+lambda_rec: 1.0
+lambda_align: 1.0
+lambda_kl: 0.1
+
+# Latent noise for robustness
+noise_sigma: 0.1
+
+# Training schedule
+align_until_frac: 0.5   # Use alignment loss until this fraction of training
+kl_start_frac: 1     # Start KL loss at this fraction of training
+
+# Optimizer settings
+optimizer:
+  lr: 1e-4
+  betas:
+    - 0.9
+    - 0.95
+  weight_decay: 4e-4
+
+# EMA for student
+ema_decay: 0.999
+
+sampling_config:
+  use_com_adjustment: True
+

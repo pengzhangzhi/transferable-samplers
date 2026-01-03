@@ -1,0 +1,57 @@
+# @package _global_
+#
+# FastFlow training for Ace-A-Nme single system
+#
+# Requires a pretrained TarFlow teacher checkpoint.
+# Train teacher first with: experiment=training/single_system/tarflow_Ace-A-Nme
+
+defaults:
+  - override /model: fastflow
+  - override /model/net: tarflow_single_system
+  - override /data: single_system/Ace-A-Nme
+  - override /trainer: gpu
+
+model:
+  # Path to pretrained teacher checkpoint
+  teacher_ckpt_path: path/to/teacher_checkpoint_weights_only.ckpt
+
+  # Student architecture (must match teacher)
+  net:
+    in_channels: 1
+    img_size: 66
+    num_blocks: 4
+    layers_per_block: 4
+
+  # Feature alignment adapter dimension (should match TarFlow hidden dim)
+  adapter_dim: 1
+
+  # Loss weights
+  lambda_rec: 1.0
+  lambda_align: 1.0
+  lambda_kl: 0.01
+
+  # Latent noise for robustness
+  noise_sigma: 0.1
+
+  # Training schedule
+  align_until_frac: 0.5
+  kl_start_frac: 0
+
+  optimizer:
+    lr: 1e-4
+    weight_decay: 4e-4
+
+  sampling_config:
+    num_proposal_samples: 10_000
+    num_test_proposal_samples: 10_000
+
+data:
+  batch_size: 512
+  com_augmentation: True
+  num_eval_samples: 10_000
+
+trainer:
+  check_val_every_n_epoch: 50
+  max_epochs: 2000
+  num_sanity_val_steps: 0
+
