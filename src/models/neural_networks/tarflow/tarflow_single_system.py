@@ -288,13 +288,16 @@ class MetaBlock(torch.nn.Module):
         guide_what: str = "ab",
         attn_temp: float = 1.0,
         annealed_guidance: bool = False,
-    ) -> torch.Tensor:
+        return_logdets: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         x = self.permutation(x)
         pos_embed = self.permutation(self.pos_embed, dim=0)
         self.set_sample_mode(True)
         T = x.size(1)
+        C = x.size(2)  # in_channels
         # 512 x 8 x 1
         xs = [x[:, i] for i in range(x.size(1))]
+        logdet_accum = torch.zeros(x.size(0), device=x.device)
         for i in range(x.size(1) - 1):
             za, zb = self.reverse_step(x, pos_embed, i, y, which_cache="cond")
             if guidance > 0 and guide_what:
@@ -309,14 +312,17 @@ class MetaBlock(torch.nn.Module):
                     zb = zb + g * (zb - zb_u)
 
             scale = za[:, 0].float().exp().type(za.dtype)  # get rid of the sequence dimension
-            # x_copy = x.clone()
-            # x_copy[:, i + 1] = x[:, i + 1] * scale + zb[:, 0]
-            # x = x_copy
-            # x[:, i + 1] = x[:, i + 1] * scale + zb[:, 0]
+            # Accumulate raw sum (will normalize at the end to match forward)
+            logdet_accum = logdet_accum + za[:, 0].sum(dim=-1)
             xs[i + 1] = xs[i + 1] * scale + zb[:, 0]
             x = torch.stack(xs, dim=1)
         self.set_sample_mode(False)
-        return self.permutation(x, inverse=True)
+        x_out = self.permutation(x, inverse=True)
+        if return_logdets:
+            # Normalize by T*C to match forward's mean(dim=[1,2])
+            logdet = logdet_accum / (T * C)
+            return x_out, logdet
+        return x_out
 
 
 class TarFlow(torch.nn.Module):
@@ -364,17 +370,22 @@ class TarFlow(torch.nn.Module):
             assert not self.img_size % self.in_channels
 
     def forward(
-        self, x: torch.Tensor, y: torch.Tensor | None = None, *args, **kwargs
-    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+        self, x: torch.Tensor, y: torch.Tensor | None = None, return_intermediates: bool = False, *args, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         original_channels = x.shape[-1]
         if self.in_channels != original_channels:
             x = x.reshape(x.shape[0], -1, self.in_channels)
         logdets = torch.zeros((), device=x.device)
+        intermediates = [] if return_intermediates else None
         for block in self.blocks:
             x, logdet = block(x, y)
             logdets = logdets + logdet
+            if return_intermediates:
+                intermediates.append(x.clone())
         if self.in_channels != original_channels:
             x = x.reshape(x.shape[0], -1, original_channels)
+        if return_intermediates:
+            return x, logdets, intermediates
         return x, logdets
 
     def reverse(
@@ -386,18 +397,26 @@ class TarFlow(torch.nn.Module):
         attn_temp: float = 1.0,
         annealed_guidance: bool = False,
         return_sequence: bool = False,
+        return_logdets: bool = False,
         *args,
         **kwargs,
-    ) -> torch.Tensor | list[torch.Tensor]:
+    ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]:
         seq = [x.detach().clone()]
         original_channels = x.shape[-1]
         if self.in_channels != original_channels:
             x = x.reshape(x.shape[0], -1, self.in_channels)
+        logdets = torch.zeros((), device=x.device)
         for block in reversed(self.blocks):
-            x = block.reverse(x, y, guidance, guide_what, attn_temp, annealed_guidance)
+            if return_logdets:
+                x, logdet = block.reverse(x, y, guidance, guide_what, attn_temp, annealed_guidance, return_logdets=True)
+                logdets = logdets + logdet
+            else:
+                x = block.reverse(x, y, guidance, guide_what, attn_temp, annealed_guidance)
             seq.append(x.detach().clone())
         if self.in_channels != original_channels:
             x = x.reshape(x.shape[0], -1, original_channels)
+        if return_logdets:
+            return x, logdets
         if not return_sequence:
             return x
         else:

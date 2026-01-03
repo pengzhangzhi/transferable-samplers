@@ -324,7 +324,8 @@ class MetaBlock(torch.nn.Module):
         x: torch.Tensor,
         permutations: dict[str, torch.Tensor],
         cond: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_logdets: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         x = self.permutation(x, permutations)
 
         # no permutation on pos_embed - it encodes sequence position AFTER permutation
@@ -336,24 +337,35 @@ class MetaBlock(torch.nn.Module):
             cond = self.permutation(cond, permutations)
 
         self.set_sample_mode(True)
-        xs = [x[:, i] for i in range(x.size(1))]
+        T = x.size(1)
+        xs = [x[:, i] for i in range(T)]
+        logdet_accum = torch.zeros(x.size(0), device=x.device)
         tokenization_map = permutations.get("tokenization_map", None)
         if tokenization_map is not None:
             tokenization_mask = (tokenization_map != -1).float().repeat_interleave(3, dim=-1)  # TODO hardcode
             tokenization_mask = self.permutation(tokenization_mask, permutations)
             tokenization_masks = [tokenization_mask[:, i] for i in range(tokenization_mask.size(1))]
-        for i in range(x.size(1) - 1):
+            data_dim = (tokenization_map != -1).int().sum(dim=[1, 2]) * 3
+        else:
+            data_dim = T * self.in_channels
+        for i in range(T - 1):
             za, zb = self.reverse_step(x, cond, pos_embed, i, which_cache="cond")
             if tokenization_map is not None:
                 zb = zb * tokenization_masks[i + 1]
                 za = za * tokenization_masks[i + 1]
             scale = za[:, 0].float().exp().type(za.dtype)  # get rid of the sequence dimension
+            # Accumulate raw sum (will normalize at the end to match forward)
+            logdet_accum = logdet_accum + za[:, 0].sum(dim=-1)
             xs[i + 1] = xs[i + 1] * scale + zb[:, 0]
             x = torch.stack(xs, dim=1)
 
         self.set_sample_mode(False)
         x = self.permutation(x, permutations, inverse=True)
 
+        if return_logdets:
+            # Normalize by data_dim to match forward's normalization
+            logdet = logdet_accum / data_dim
+            return x, logdet
         return x
 
 
@@ -422,7 +434,8 @@ class TarFlow(torch.nn.Module):
         permutations: dict[str, torch.Tensor],
         encodings: dict[str, torch.Tensor] | None = None,
         mask: torch.Tensor = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_intermediates: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         if mask is not None:
             assert mask.ndim == 2, "Mask should be 2D"
             assert torch.all(x.sum(dim=-1)[mask == 0] == 0), "x is not zero where mask is zero"
@@ -440,11 +453,16 @@ class TarFlow(torch.nn.Module):
             cond = None
 
         logdets = torch.zeros((), device=x.device)
+        intermediates = [] if return_intermediates else None
 
         for block in self.blocks:
             x, logdet = block(x, permutations, cond=cond, mask=mask)
             logdets = logdets + logdet
+            if return_intermediates:
+                intermediates.append(x.clone())
 
+        if return_intermediates:
+            return x, logdets, intermediates
         return x, logdets
 
     def reverse(
@@ -452,7 +470,8 @@ class TarFlow(torch.nn.Module):
         x: torch.Tensor,
         permutations: dict[str, torch.Tensor],
         encodings: dict[str, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
+        return_logdets: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """No masking in reverse since we assume the model generates a single peptide system as a time."""
 
         if self.conditional:
@@ -469,7 +488,14 @@ class TarFlow(torch.nn.Module):
         else:
             cond = None
 
+        logdets = torch.zeros((), device=x.device)
         for block in reversed(self.blocks):
-            x = block.reverse(x, permutations, cond=cond)
+            if return_logdets:
+                x, logdet = block.reverse(x, permutations, cond=cond, return_logdets=True)
+                logdets = logdets + logdet
+            else:
+                x = block.reverse(x, permutations, cond=cond)
 
+        if return_logdets:
+            return x, logdets
         return x
