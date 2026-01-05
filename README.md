@@ -50,7 +50,13 @@ The codebase builds on the [Lightning-Hydra-Template](https://github.com/ashleve
 To train a TarFlow on the single system Ace-A-Nme dataset run:
 
 ```
-python src/train.py experiment=training/single_system/tarflow_Ace-A-Nme
+SCRATCH_DIR='./scratch' python src/train.py experiment=training/single_system/tarflow_Ace-A-Nme  trainer=ddp 
+```
+
+To train FastFlow on the single system Ace-A-Nme dataset run:
+
+```
+SCRATCH_DIR='./scratch' python src/train.py experiment=training/single_system/fastflow_Ace-A-Nme model.teacher_ckpt_path='scratch/transferable-samplers/logs/train/runs/2026-01-01_19-10-21/checkpoints/last_weights_only.ckpt' trainer.devices='auto' +trainer.strategy="ddp_find_unused_parameters_true" 'trainer.plugins=[]'
 ```
 
 To train Prose on the ManyPeptidesMD dataset
@@ -64,7 +70,7 @@ python src/train.py experiment=training/transferable/prose_up_to_8aa
 The sampling experiment configs will default to downloading and using the pretrained model weights provided [here](https://huggingface.co/transferable-samplers/model-weights).
 
 ```
-python src/eval_only.py experiment=evaluation/transferable/prose_up_to_8aa
+SCRATCH_DIR='./scratch' python src/eval.py experiment=evaluation/single_system/tarflow_Ace-A-Nme_ula.yaml state_dict_hf_path=scratch/transferable-samplers/logs/train/runs/2025-12-23_18-47-24/checkpoints/last_weights_only.ckpt
 ```
 
 To use a locally generated checkpoint, you may pass in the argument `ckpt_path` to override the remote weights usage.
