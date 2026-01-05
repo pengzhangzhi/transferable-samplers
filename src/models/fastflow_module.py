@@ -43,11 +43,13 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
         teacher_ckpt_path: str,
         adapter_dim: int = 256,
         lambda_rec: float = 1.0,
+        lambda_dist: float = 1.0,
         lambda_align: float = 1.0,
         lambda_kl: float = 0.1,
         noise_sigma: float = 0.1,
         align_until_frac: float = 0.5,
         kl_start_frac: float = 0.67,
+        student_ckpt_path: Optional[str] = None,
         *args,
         **kwargs,
     ) -> None:
@@ -57,12 +59,14 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
             net: Student network (same architecture as teacher).
             teacher_ckpt_path: Path to pretrained teacher checkpoint.
             adapter_dim: Hidden dimension for feature alignment adapters.
-            lambda_rec: Weight for reconstruction loss.
+            lambda_rec: Weight for reconstruction loss (coordinate L2).
+            lambda_dist: Weight for distance matrix matching loss.
             lambda_align: Weight for feature alignment loss.
             lambda_kl: Weight for reverse KL loss.
             noise_sigma: Max noise std for latent jittering.
             align_until_frac: Fraction of training to use alignment loss.
             kl_start_frac: Fraction of training to start KL loss.
+            student_ckpt_path: Path to pretrained student weights (weights only, fresh optimizer).
         """
         super().__init__(net=net, *args, **kwargs)
 
@@ -71,6 +75,10 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
             ignore=["net", "datamodule"],
             logger=False,
         )
+
+        # Load pretrained student weights if provided (fresh optimizer, reset epoch)
+        if student_ckpt_path is not None:
+            self._load_student_weights(student_ckpt_path)
 
         # Create and load teacher (frozen)
         self.teacher = self._create_and_load_teacher(teacher_ckpt_path)
@@ -83,6 +91,40 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
         if isinstance(self.net, EMA):
             return self.net.model
         return self.net
+
+    def _load_student_weights(self, ckpt_path: str) -> None:
+        """Load pretrained weights into student (fresh optimizer, reset epoch).
+
+        This allows continuing training from pretrained weights with a new
+        optimizer and learning rate, unlike ckpt_path which restores full state.
+        """
+        logger.info(f"Loading pretrained student weights from: {ckpt_path}")
+
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        # Handle different checkpoint formats
+        if any(k.startswith("net.model.") for k in state_dict.keys()):
+            # EMA checkpoint format (keys have 'net.model.' prefix)
+            logger.info("Detected EMA checkpoint format, stripping prefixes...")
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if "shadow_params" in k or "num_updates" in k:
+                    continue
+                if k.startswith("net.model."):
+                    new_key = k[len("net.model."):]
+                    new_state_dict[new_key] = v
+                elif k.startswith("net."):
+                    new_key = k[len("net."):]
+                    new_state_dict[new_key] = v
+            state_dict = new_state_dict
+        elif any(k.startswith("net.") for k in state_dict.keys()):
+            # Standard Lightning checkpoint with 'net.' prefix
+            logger.info("Detected Lightning checkpoint format, stripping 'net.' prefix...")
+            state_dict = {k[len("net."):]: v for k, v in state_dict.items() if k.startswith("net.")}
+
+        student_model = self._get_student_model()
+        student_model.load_state_dict(state_dict)
+        logger.info("Student weights loaded successfully (fresh optimizer)")
 
     def _create_and_load_teacher(self, ckpt_path: str) -> nn.Module:
         """Create teacher from student architecture and load pretrained weights."""
@@ -157,16 +199,21 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
         with torch.no_grad():
             z_teacher, _, feats_t = self.teacher(x, return_intermediates=True)
             # Clamp for stability
-            feats_t = [torch.clamp(h, -1, 1) for h in feats_t]
+            # feats_t = [torch.clamp(h, -1, 1) for h in feats_t]
 
             z_input = z_teacher
 
         # Student decoding
         x_hat, _, feats_s = student(z_input, return_intermediates=True)
 
-        # Reconstruction loss
+        # Reconstruction loss (coordinate L2)
         L_rec = F.mse_loss(x_hat, x)
 
+        # Distance matrix matching loss (rotation/translation invariant)
+        # x shape: (batch, num_atoms, 3)
+        dist_x = torch.cdist(x, x)  # (batch, num_atoms, num_atoms)
+        dist_x_hat = torch.cdist(x_hat, x_hat)
+        L_dist = F.mse_loss(dist_x_hat, dist_x)
         # ===== ALIGNMENT LOSS (early training) =====
         L_align = torch.zeros((), device=x.device)
         if use_align:
@@ -183,6 +230,7 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
         # Total loss
         loss = (
             self.hparams.lambda_rec * L_rec
+            + self.hparams.lambda_dist * L_dist
             + self.hparams.lambda_align * L_align
             + self.hparams.lambda_kl * L_kl
         )
@@ -190,6 +238,7 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
         # Logging (train/loss is logged by parent class via train_metrics)
         if log:
             self.log("train/L_rec", L_rec.item(), prog_bar=True, sync_dist=True)
+            self.log("train/L_dist", L_dist.item(), prog_bar=True, sync_dist=True)
             self.log("train/L_align", L_align.item(), prog_bar=True, sync_dist=True)
             self.log("train/L_kl", L_kl.item(), prog_bar=True, sync_dist=True)
             self.log("train/use_align", float(use_align), sync_dist=True)
