@@ -13,7 +13,7 @@ defaults:
 
 model:
   # Path to pretrained teacher checkpoint
-  teacher_ckpt_path: path/to/teacher_checkpoint_weights_only.ckpt
+  teacher_ckpt_path: null
 
   # Student architecture (must match teacher)
   net:
@@ -44,6 +44,7 @@ model:
   sampling_config:
     num_proposal_samples: 10_000
     num_test_proposal_samples: 10_000
+    clip_reweighting_logits: 0.002
 
 data:
   batch_size: 512

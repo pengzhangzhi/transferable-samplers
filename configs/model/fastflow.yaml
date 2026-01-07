@@ -6,8 +6,8 @@ defaults:
 _target_: src.models.fastflow_module.FastFlowLitModule
 mean_free_prior: False
 
-# Teacher checkpoint path (must be provided in experiment config)
-teacher_ckpt_path: ???
+# Teacher checkpoint path (required for training, null for eval-only)
+teacher_ckpt_path: null
 
 # Feature alignment adapters
 adapter_dim: 1
