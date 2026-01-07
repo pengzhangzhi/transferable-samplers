@@ -40,7 +40,7 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
     def __init__(
         self,
         net: torch.nn.Module,
-        teacher_ckpt_path: str,
+        teacher_ckpt_path: Optional[str] = None,
         adapter_dim: int = 256,
         lambda_rec: float = 1.0,
         lambda_dist: float = 1.0,
@@ -57,7 +57,7 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
 
         Args:
             net: Student network (same architecture as teacher).
-            teacher_ckpt_path: Path to pretrained teacher checkpoint.
+            teacher_ckpt_path: Path to pretrained teacher checkpoint. None for eval-only mode.
             adapter_dim: Hidden dimension for feature alignment adapters.
             lambda_rec: Weight for reconstruction loss (coordinate L2).
             lambda_dist: Weight for distance matrix matching loss.
@@ -79,12 +79,10 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
         # Load pretrained student weights if provided (fresh optimizer, reset epoch)
         if student_ckpt_path is not None:
             self._load_student_weights(student_ckpt_path)
-
-        # Create and load teacher (frozen)
+    
         self.teacher = self._create_and_load_teacher(teacher_ckpt_path)
-
-        # Create adapters for feature alignment
         self._create_adapters(adapter_dim)
+    
 
     def _get_student_model(self) -> nn.Module:
         """Get the underlying student model (handles EMA wrapping)."""
@@ -133,26 +131,26 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
         # Deepcopy the student architecture for teacher
         student_model = self._get_student_model()
         teacher = deepcopy(student_model)
+        if ckpt_path is not None:
+            # Load weights
+            state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-        # Load weights
-        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            # Handle EMA checkpoint format (keys have 'net.model.' prefix)
+            if any(k.startswith("net.model.") for k in state_dict.keys()):
+                logger.info("Detected EMA checkpoint format, stripping prefixes...")
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if "shadow_params" in k or "num_updates" in k:
+                        continue
+                    if k.startswith("net.model."):
+                        new_key = k[len("net.model."):]
+                        new_state_dict[new_key] = v
+                    elif k.startswith("net."):
+                        new_key = k[len("net."):]
+                        new_state_dict[new_key] = v
+                state_dict = new_state_dict
 
-        # Handle EMA checkpoint format (keys have 'net.model.' prefix)
-        if any(k.startswith("net.model.") for k in state_dict.keys()):
-            logger.info("Detected EMA checkpoint format, stripping prefixes...")
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if "shadow_params" in k or "num_updates" in k:
-                    continue
-                if k.startswith("net.model."):
-                    new_key = k[len("net.model."):]
-                    new_state_dict[new_key] = v
-                elif k.startswith("net."):
-                    new_key = k[len("net."):]
-                    new_state_dict[new_key] = v
-            state_dict = new_state_dict
-
-        teacher.load_state_dict(state_dict)
+            teacher.load_state_dict(state_dict)
 
         # Freeze teacher
         teacher.eval()
@@ -338,6 +336,15 @@ class FastFlowLitModule(TransferableBoltzmannGeneratorLitModule):
             # FAST: student.forward(z) → x directly (one parallel pass!)
             x_pred, fwd_logdets = student(prior_samples)
             fwd_logdets = fwd_logdets * data_dim
+
+            # Invertibility check: x → z_recon (should match prior_samples)
+            z_recon, _ = student.reverse(x_pred, return_logdets=True)
+            diff = prior_samples - z_recon
+            self.log("invert/mse", diff.pow(2).mean(), sync_dist=True)
+            self.log("invert/max_abs", diff.abs().max(), sync_dist=True)
+            self.log("invert/mean_abs", diff.abs().mean(), sync_dist=True)
+            for cutoff in [0.01, 0.001]:
+                self.log(f"invert/fail_count_{cutoff}", (diff.abs() > cutoff).sum().float(), sync_dist=True)
 
             # DDP all_gather
             x_pred = self.all_gather(x_pred).reshape(-1, *x_pred.shape[1:])
