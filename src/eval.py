@@ -143,11 +143,11 @@ def eval(cfg: DictConfig) -> tuple[dict[str, Any], dict[str, Any]]:
         model.load_state_dict(state_dict)
 
     assert cfg.get("val", False) or cfg.get("test", False), "At least one of validation or test must be enabled!"
-
+    model.strict_loading = False
     if cfg.get("val"):
         log.info("Starting validation!")
         trainer.validate(
-            model=model, datamodule=datamodule, ckpt_path=ckpt_path
+            model=model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False,
         )  # ckpt_path is None if using state_dict_hf_path
         val_metrics = trainer.callback_metrics
     else:
@@ -156,7 +156,7 @@ def eval(cfg: DictConfig) -> tuple[dict[str, Any], dict[str, Any]]:
     if cfg.get("test"):
         log.info("Starting testing!")
         trainer.test(
-            model=model, datamodule=datamodule, ckpt_path=ckpt_path
+            model=model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False,
         )  # ckpt_path is None if using state_dict_hf_path
         test_metrics = trainer.callback_metrics
     else:
